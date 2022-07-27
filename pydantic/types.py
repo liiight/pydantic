@@ -1,31 +1,56 @@
-import json
+import math
 import re
+import warnings
+from datetime import date
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
-from typing import Optional, Pattern, Set, Type, Union
+from types import new_class
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    FrozenSet,
+    List,
+    Optional,
+    Pattern,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
 from uuid import UUID
+from weakref import WeakSet
 
 from . import errors
-from .utils import import_string, make_dsn, url_regex_generator, validate_email
+from .datetime_parse import parse_date
+from .utils import import_string, update_not_none
 from .validators import (
-    anystr_length_validator,
-    anystr_strip_whitespace,
     bytes_validator,
+    constr_length_validator,
+    constr_lower,
+    constr_strip_whitespace,
     decimal_validator,
     float_validator,
+    frozenset_validator,
     int_validator,
-    not_none_validator,
+    list_validator,
     number_multiple_validator,
     number_size_validator,
     path_exists_validator,
     path_validator,
+    set_validator,
     str_validator,
+    strict_bytes_validator,
+    strict_float_validator,
+    strict_int_validator,
+    strict_str_validator,
 )
-
-try:
-    import email_validator
-except ImportError:
-    email_validator = None
 
 __all__ = [
     'NoneStr',
@@ -35,22 +60,27 @@ __all__ = [
     'StrictStr',
     'ConstrainedBytes',
     'conbytes',
+    'ConstrainedList',
+    'conlist',
+    'ConstrainedSet',
+    'conset',
+    'ConstrainedFrozenSet',
+    'confrozenset',
     'ConstrainedStr',
     'constr',
-    'EmailStr',
-    'UrlStr',
-    'urlstr',
-    'NameEmail',
     'PyObject',
-    'DSN',
     'ConstrainedInt',
     'conint',
     'PositiveInt',
     'NegativeInt',
+    'NonNegativeInt',
+    'NonPositiveInt',
     'ConstrainedFloat',
     'confloat',
     'PositiveFloat',
     'NegativeFloat',
+    'NonNegativeFloat',
+    'NonPositiveFloat',
     'ConstrainedDecimal',
     'condecimal',
     'UUID1',
@@ -61,62 +91,318 @@ __all__ = [
     'DirectoryPath',
     'Json',
     'JsonWrapper',
+    'SecretStr',
+    'SecretBytes',
+    'StrictBool',
+    'StrictBytes',
+    'StrictInt',
+    'StrictFloat',
+    'PaymentCardNumber',
+    'ByteSize',
+    'PastDate',
+    'FutureDate',
 ]
 
 NoneStr = Optional[str]
 NoneBytes = Optional[bytes]
 StrBytes = Union[str, bytes]
 NoneStrBytes = Optional[StrBytes]
+OptionalInt = Optional[int]
+OptionalIntFloat = Union[OptionalInt, float]
+OptionalIntFloatDecimal = Union[OptionalIntFloat, Decimal]
+StrIntFloat = Union[str, int, float]
+
+if TYPE_CHECKING:
+    from .dataclasses import Dataclass
+    from .main import BaseModel
+    from .typing import CallableGenerator
+
+    ModelOrDc = Type[Union['BaseModel', 'Dataclass']]
+
+T = TypeVar('T')
+_DEFINED_TYPES: 'WeakSet[type]' = WeakSet()
 
 
-class StrictStr(str):
+@overload
+def _registered(typ: Type[T]) -> Type[T]:
+    pass
+
+
+@overload
+def _registered(typ: 'ConstrainedNumberMeta') -> 'ConstrainedNumberMeta':
+    pass
+
+
+def _registered(typ: Union[Type[T], 'ConstrainedNumberMeta']) -> Union[Type[T], 'ConstrainedNumberMeta']:
+    # In order to generate valid examples of constrained types, Hypothesis needs
+    # to inspect the type object - so we keep a weakref to each contype object
+    # until it can be registered.  When (or if) our Hypothesis plugin is loaded,
+    # it monkeypatches this function.
+    # If Hypothesis is never used, the total effect is to keep a weak reference
+    # which has minimal memory usage and doesn't even affect garbage collection.
+    _DEFINED_TYPES.add(typ)
+    return typ
+
+
+class ConstrainedNumberMeta(type):
+    def __new__(cls, name: str, bases: Any, dct: Dict[str, Any]) -> 'ConstrainedInt':  # type: ignore
+        new_cls = cast('ConstrainedInt', type.__new__(cls, name, bases, dct))
+
+        if new_cls.gt is not None and new_cls.ge is not None:
+            raise errors.ConfigError('bounds gt and ge cannot be specified at the same time')
+        if new_cls.lt is not None and new_cls.le is not None:
+            raise errors.ConfigError('bounds lt and le cannot be specified at the same time')
+
+        return _registered(new_cls)  # type: ignore
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ BOOLEAN TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+if TYPE_CHECKING:
+    StrictBool = bool
+else:
+
+    class StrictBool(int):
+        """
+        StrictBool to allow for bools which are not type-coerced.
+        """
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            field_schema.update(type='boolean')
+
+        @classmethod
+        def __get_validators__(cls) -> 'CallableGenerator':
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, value: Any) -> bool:
+            """
+            Ensure that we only allow bools.
+            """
+            if isinstance(value, bool):
+                return value
+
+            raise errors.StrictBoolError()
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ INTEGER TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class ConstrainedInt(int, metaclass=ConstrainedNumberMeta):
+    strict: bool = False
+    gt: OptionalInt = None
+    ge: OptionalInt = None
+    lt: OptionalInt = None
+    le: OptionalInt = None
+    multiple_of: OptionalInt = None
+
     @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(
+            field_schema,
+            exclusiveMinimum=cls.gt,
+            exclusiveMaximum=cls.lt,
+            minimum=cls.ge,
+            maximum=cls.le,
+            multipleOf=cls.multiple_of,
+        )
 
     @classmethod
-    def validate(cls, v):
-        if not isinstance(v, str):
-            raise errors.StrError()
-        return v
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield strict_int_validator if cls.strict else int_validator
+        yield number_size_validator
+        yield number_multiple_validator
+
+
+def conint(
+    *, strict: bool = False, gt: int = None, ge: int = None, lt: int = None, le: int = None, multiple_of: int = None
+) -> Type[int]:
+    # use kwargs then define conf in a dict to aid with IDE type hinting
+    namespace = dict(strict=strict, gt=gt, ge=ge, lt=lt, le=le, multiple_of=multiple_of)
+    return type('ConstrainedIntValue', (ConstrainedInt,), namespace)
+
+
+if TYPE_CHECKING:
+    PositiveInt = int
+    NegativeInt = int
+    NonPositiveInt = int
+    NonNegativeInt = int
+    StrictInt = int
+else:
+
+    class PositiveInt(ConstrainedInt):
+        gt = 0
+
+    class NegativeInt(ConstrainedInt):
+        lt = 0
+
+    class NonPositiveInt(ConstrainedInt):
+        le = 0
+
+    class NonNegativeInt(ConstrainedInt):
+        ge = 0
+
+    class StrictInt(ConstrainedInt):
+        strict = True
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ FLOAT TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class ConstrainedFloat(float, metaclass=ConstrainedNumberMeta):
+    strict: bool = False
+    gt: OptionalIntFloat = None
+    ge: OptionalIntFloat = None
+    lt: OptionalIntFloat = None
+    le: OptionalIntFloat = None
+    multiple_of: OptionalIntFloat = None
+
+    @classmethod
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(
+            field_schema,
+            exclusiveMinimum=cls.gt,
+            exclusiveMaximum=cls.lt,
+            minimum=cls.ge,
+            maximum=cls.le,
+            multipleOf=cls.multiple_of,
+        )
+        # Modify constraints to account for differences between IEEE floats and JSON
+        if field_schema.get('exclusiveMinimum') == -math.inf:
+            del field_schema['exclusiveMinimum']
+        if field_schema.get('minimum') == -math.inf:
+            del field_schema['minimum']
+        if field_schema.get('exclusiveMaximum') == math.inf:
+            del field_schema['exclusiveMaximum']
+        if field_schema.get('maximum') == math.inf:
+            del field_schema['maximum']
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield strict_float_validator if cls.strict else float_validator
+        yield number_size_validator
+        yield number_multiple_validator
+
+
+def confloat(
+    *,
+    strict: bool = False,
+    gt: float = None,
+    ge: float = None,
+    lt: float = None,
+    le: float = None,
+    multiple_of: float = None,
+) -> Type[float]:
+    # use kwargs then define conf in a dict to aid with IDE type hinting
+    namespace = dict(strict=strict, gt=gt, ge=ge, lt=lt, le=le, multiple_of=multiple_of)
+    return type('ConstrainedFloatValue', (ConstrainedFloat,), namespace)
+
+
+if TYPE_CHECKING:
+    PositiveFloat = float
+    NegativeFloat = float
+    NonPositiveFloat = float
+    NonNegativeFloat = float
+    StrictFloat = float
+else:
+
+    class PositiveFloat(ConstrainedFloat):
+        gt = 0
+
+    class NegativeFloat(ConstrainedFloat):
+        lt = 0
+
+    class NonPositiveFloat(ConstrainedFloat):
+        le = 0
+
+    class NonNegativeFloat(ConstrainedFloat):
+        ge = 0
+
+    class StrictFloat(ConstrainedFloat):
+        strict = True
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ BYTES TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
 class ConstrainedBytes(bytes):
     strip_whitespace = False
-    min_length: Optional[int] = None
-    max_length: Optional[int] = None
+    to_lower = False
+    min_length: OptionalInt = None
+    max_length: OptionalInt = None
+    strict: bool = False
 
     @classmethod
-    def __get_validators__(cls):
-        yield not_none_validator
-        yield bytes_validator
-        yield anystr_strip_whitespace
-        yield anystr_length_validator
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(field_schema, minLength=cls.min_length, maxLength=cls.max_length)
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield strict_bytes_validator if cls.strict else bytes_validator
+        yield constr_strip_whitespace
+        yield constr_lower
+        yield constr_length_validator
 
 
-def conbytes(*, strip_whitespace=False, min_length=None, max_length=None) -> Type[bytes]:
+def conbytes(
+    *,
+    strip_whitespace: bool = False,
+    to_lower: bool = False,
+    min_length: int = None,
+    max_length: int = None,
+    strict: bool = False,
+) -> Type[bytes]:
     # use kwargs then define conf in a dict to aid with IDE type hinting
-    namespace = dict(strip_whitespace=strip_whitespace, min_length=min_length, max_length=max_length)
-    return type('ConstrainedBytesValue', (ConstrainedBytes,), namespace)
+    namespace = dict(
+        strip_whitespace=strip_whitespace,
+        to_lower=to_lower,
+        min_length=min_length,
+        max_length=max_length,
+        strict=strict,
+    )
+    return _registered(type('ConstrainedBytesValue', (ConstrainedBytes,), namespace))
+
+
+if TYPE_CHECKING:
+    StrictBytes = bytes
+else:
+
+    class StrictBytes(ConstrainedBytes):
+        strict = True
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ STRING TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
 class ConstrainedStr(str):
     strip_whitespace = False
-    min_length: Optional[int] = None
-    max_length: Optional[int] = None
-    curtail_length: Optional[int] = None
-    regex: Optional[Pattern] = None
+    to_lower = False
+    min_length: OptionalInt = None
+    max_length: OptionalInt = None
+    curtail_length: OptionalInt = None
+    regex: Optional[Pattern[str]] = None
+    strict = False
 
     @classmethod
-    def __get_validators__(cls):
-        yield not_none_validator
-        yield str_validator
-        yield anystr_strip_whitespace
-        yield anystr_length_validator
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(
+            field_schema,
+            minLength=cls.min_length,
+            maxLength=cls.max_length,
+            pattern=cls.regex and cls.regex.pattern,
+        )
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield strict_str_validator if cls.strict else str_validator
+        yield constr_strip_whitespace
+        yield constr_lower
+        yield constr_length_validator
         yield cls.validate
 
     @classmethod
-    def validate(cls, value: str) -> str:
+    def validate(cls, value: Union[str]) -> Union[str]:
         if cls.curtail_length and len(value) > cls.curtail_length:
             value = value[: cls.curtail_length]
 
@@ -127,231 +413,237 @@ class ConstrainedStr(str):
         return value
 
 
-def constr(*, strip_whitespace=False, min_length=None, max_length=None, curtail_length=None, regex=None) -> Type[str]:
+def constr(
+    *,
+    strip_whitespace: bool = False,
+    to_lower: bool = False,
+    strict: bool = False,
+    min_length: int = None,
+    max_length: int = None,
+    curtail_length: int = None,
+    regex: str = None,
+) -> Type[str]:
     # use kwargs then define conf in a dict to aid with IDE type hinting
     namespace = dict(
         strip_whitespace=strip_whitespace,
+        to_lower=to_lower,
+        strict=strict,
         min_length=min_length,
         max_length=max_length,
         curtail_length=curtail_length,
         regex=regex and re.compile(regex),
     )
-    return type('ConstrainedStrValue', (ConstrainedStr,), namespace)
+    return _registered(type('ConstrainedStrValue', (ConstrainedStr,), namespace))
 
 
-class EmailStr(str):
-    @classmethod
-    def __get_validators__(cls):
-        # included here and below so the error happens straight away
-        if email_validator is None:
-            raise ImportError('email-validator is not installed, run `pip install pydantic[email]`')
+if TYPE_CHECKING:
+    StrictStr = str
+else:
 
-        yield str_validator
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, value):
-        return validate_email(value)[1]
+    class StrictStr(ConstrainedStr):
+        strict = True
 
 
-class UrlStr(str):
-    strip_whitespace = True
-    min_length = 1
-    max_length = 2 ** 16
-    schemes: Optional[Set[str]] = None
-    relative = False  # whether to allow relative URLs
-    require_tld = True  # whether to reject non-FQDN hostnames
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ SET TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# This types superclass should be Set[T], but cython chokes on that...
+class ConstrainedSet(set):  # type: ignore
+    # Needed for pydantic to detect that this is a set
+    __origin__ = set
+    __args__: Set[Type[T]]  # type: ignore
+
+    min_items: Optional[int] = None
+    max_items: Optional[int] = None
+    item_type: Type[T]  # type: ignore
 
     @classmethod
-    def __get_validators__(cls):
-        yield not_none_validator
-        yield str_validator
-        yield anystr_strip_whitespace
-        yield anystr_length_validator
-        yield cls.validate
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield cls.set_length_validator
 
     @classmethod
-    def validate(cls, value: str) -> str:
-        # Check first if the scheme is valid
-        schemes = cls.schemes or {'http', 'https', 'ftp', 'ftps'}
-        if '://' in value:
-            scheme = value.split('://')[0].lower()
-            if scheme not in schemes:
-                raise errors.UrlSchemeError(scheme=scheme)
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(field_schema, minItems=cls.min_items, maxItems=cls.max_items)
 
-        regex = url_regex_generator(relative=cls.relative, require_tld=cls.require_tld)
-        if not regex.match(value):
-            raise errors.UrlRegexError()
+    @classmethod
+    def set_length_validator(cls, v: 'Optional[Set[T]]') -> 'Optional[Set[T]]':
+        if v is None:
+            return None
 
-        return value
+        v = set_validator(v)
+        v_len = len(v)
+
+        if cls.min_items is not None and v_len < cls.min_items:
+            raise errors.SetMinLengthError(limit_value=cls.min_items)
+
+        if cls.max_items is not None and v_len > cls.max_items:
+            raise errors.SetMaxLengthError(limit_value=cls.max_items)
+
+        return v
 
 
-def urlstr(
-    *,
-    strip_whitespace=True,
-    min_length=1,
-    max_length=2 ** 16,
-    relative=False,
-    require_tld=True,
-    schemes: Optional[Set[str]] = None,
-) -> Type[str]:
-    # use kwargs then define conf in a dict to aid with IDE type hinting
+def conset(item_type: Type[T], *, min_items: int = None, max_items: int = None) -> Type[Set[T]]:
+    # __args__ is needed to conform to typing generics api
+    namespace = {'min_items': min_items, 'max_items': max_items, 'item_type': item_type, '__args__': [item_type]}
+    # We use new_class to be able to deal with Generic types
+    return new_class('ConstrainedSetValue', (ConstrainedSet,), {}, lambda ns: ns.update(namespace))
+
+
+# This types superclass should be FrozenSet[T], but cython chokes on that...
+class ConstrainedFrozenSet(frozenset):  # type: ignore
+    # Needed for pydantic to detect that this is a set
+    __origin__ = frozenset
+    __args__: FrozenSet[Type[T]]  # type: ignore
+
+    min_items: Optional[int] = None
+    max_items: Optional[int] = None
+    item_type: Type[T]  # type: ignore
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield cls.frozenset_length_validator
+
+    @classmethod
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(field_schema, minItems=cls.min_items, maxItems=cls.max_items)
+
+    @classmethod
+    def frozenset_length_validator(cls, v: 'Optional[FrozenSet[T]]') -> 'Optional[FrozenSet[T]]':
+        if v is None:
+            return None
+
+        v = frozenset_validator(v)
+        v_len = len(v)
+
+        if cls.min_items is not None and v_len < cls.min_items:
+            raise errors.FrozenSetMinLengthError(limit_value=cls.min_items)
+
+        if cls.max_items is not None and v_len > cls.max_items:
+            raise errors.FrozenSetMaxLengthError(limit_value=cls.max_items)
+
+        return v
+
+
+def confrozenset(item_type: Type[T], *, min_items: int = None, max_items: int = None) -> Type[FrozenSet[T]]:
+    # __args__ is needed to conform to typing generics api
+    namespace = {'min_items': min_items, 'max_items': max_items, 'item_type': item_type, '__args__': [item_type]}
+    # We use new_class to be able to deal with Generic types
+    return new_class('ConstrainedFrozenSetValue', (ConstrainedFrozenSet,), {}, lambda ns: ns.update(namespace))
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LIST TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# This types superclass should be List[T], but cython chokes on that...
+class ConstrainedList(list):  # type: ignore
+    # Needed for pydantic to detect that this is a list
+    __origin__ = list
+    __args__: Tuple[Type[T], ...]  # type: ignore
+
+    min_items: Optional[int] = None
+    max_items: Optional[int] = None
+    unique_items: Optional[bool] = None
+    item_type: Type[T]  # type: ignore
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield cls.list_length_validator
+        if cls.unique_items:
+            yield cls.unique_items_validator
+
+    @classmethod
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(field_schema, minItems=cls.min_items, maxItems=cls.max_items, uniqueItems=cls.unique_items)
+
+    @classmethod
+    def list_length_validator(cls, v: 'Optional[List[T]]') -> 'Optional[List[T]]':
+        if v is None:
+            return None
+
+        v = list_validator(v)
+        v_len = len(v)
+
+        if cls.min_items is not None and v_len < cls.min_items:
+            raise errors.ListMinLengthError(limit_value=cls.min_items)
+
+        if cls.max_items is not None and v_len > cls.max_items:
+            raise errors.ListMaxLengthError(limit_value=cls.max_items)
+
+        return v
+
+    @classmethod
+    def unique_items_validator(cls, v: 'List[T]') -> 'List[T]':
+        for i, value in enumerate(v, start=1):
+            if value in v[i:]:
+                raise errors.ListUniqueItemsError()
+
+        return v
+
+
+def conlist(
+    item_type: Type[T], *, min_items: int = None, max_items: int = None, unique_items: bool = None
+) -> Type[List[T]]:
+    # __args__ is needed to conform to typing generics api
     namespace = dict(
-        strip_whitespace=strip_whitespace,
-        min_length=min_length,
-        max_length=max_length,
-        relative=relative,
-        require_tld=require_tld,
-        schemes=schemes,
+        min_items=min_items, max_items=max_items, unique_items=unique_items, item_type=item_type, __args__=(item_type,)
     )
-    return type('UrlStrValue', (UrlStr,), namespace)
+    # We use new_class to be able to deal with Generic types
+    return new_class('ConstrainedListValue', (ConstrainedList,), {}, lambda ns: ns.update(namespace))
 
 
-class NameEmail:
-    __slots__ = 'name', 'email'
-
-    def __init__(self, name, email):
-        self.name = name
-        self.email = email
-
-    @classmethod
-    def __get_validators__(cls):
-        if email_validator is None:
-            raise ImportError('email-validator is not installed, run `pip install pydantic[email]`')
-
-        yield str_validator
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, value):
-        return cls(*validate_email(value))
-
-    def __str__(self):
-        return f'{self.name} <{self.email}>'
-
-    def __repr__(self):
-        return f'<NameEmail("{self}")>'
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ PYOBJECT TYPE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
-class PyObject:
-    validate_always = True
+if TYPE_CHECKING:
+    PyObject = Callable[..., Any]
+else:
 
-    @classmethod
-    def __get_validators__(cls):
-        yield str_validator
-        yield cls.validate
+    class PyObject:
+        validate_always = True
 
-    @classmethod
-    def validate(cls, value):
-        if value is not None:
+        @classmethod
+        def __get_validators__(cls) -> 'CallableGenerator':
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, value: Any) -> Any:
+            if isinstance(value, Callable):
+                return value
+
+            try:
+                value = str_validator(value)
+            except errors.StrError:
+                raise errors.PyObjectError(error_message='value is neither a valid import path not a valid callable')
+
             try:
                 return import_string(value)
             except ImportError as e:
                 raise errors.PyObjectError(error_message=str(e))
 
 
-class DSN(str):
-    prefix = 'db_'
-    fields = 'driver', 'user', 'password', 'host', 'port', 'name', 'query'
-    validate_always = True
-
-    @classmethod
-    def __get_validators__(cls):
-        yield str_validator
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, value, values, **kwarg):
-        if value:
-            return value
-
-        kwargs = {f: values.get(cls.prefix + f) for f in cls.fields}
-        if kwargs['driver'] is None:
-            raise errors.DSNDriverIsEmptyError()
-
-        return make_dsn(**kwargs)
-
-
-class ConstrainedNumberMeta(type):
-    def __new__(cls, name, bases, dct):
-        new_cls = type.__new__(cls, name, bases, dct)
-
-        if new_cls.gt is not None and new_cls.ge is not None:
-            raise errors.ConfigError('bounds gt and ge cannot be specified at the same time')
-        if new_cls.lt is not None and new_cls.le is not None:
-            raise errors.ConfigError('bounds lt and le cannot be specified at the same time')
-
-        return new_cls
-
-
-class ConstrainedInt(int, metaclass=ConstrainedNumberMeta):
-    gt: Optional[int] = None
-    ge: Optional[int] = None
-    lt: Optional[int] = None
-    le: Optional[int] = None
-    multiple_of: Optional[Union[int, float]] = None
-
-    @classmethod
-    def __get_validators__(cls):
-        yield int_validator
-        yield number_size_validator
-        yield number_multiple_validator
-
-
-def conint(*, gt=None, ge=None, lt=None, le=None, multiple_of=None) -> Type[int]:
-    # use kwargs then define conf in a dict to aid with IDE type hinting
-    namespace = dict(gt=gt, ge=ge, lt=lt, le=le, multiple_of=multiple_of)
-    return type('ConstrainedIntValue', (ConstrainedInt,), namespace)
-
-
-class PositiveInt(ConstrainedInt):
-    gt = 0
-
-
-class NegativeInt(ConstrainedInt):
-    lt = 0
-
-
-class ConstrainedFloat(float, metaclass=ConstrainedNumberMeta):
-    gt: Union[None, int, float] = None
-    ge: Union[None, int, float] = None
-    lt: Union[None, int, float] = None
-    le: Union[None, int, float] = None
-    multiple_of: Optional[Union[int, float]] = None
-
-    @classmethod
-    def __get_validators__(cls):
-        yield float_validator
-        yield number_size_validator
-        yield number_multiple_validator
-
-
-def confloat(*, gt=None, ge=None, lt=None, le=None, multiple_of=None) -> Type[float]:
-    # use kwargs then define conf in a dict to aid with IDE type hinting
-    namespace = dict(gt=gt, ge=ge, lt=lt, le=le, multiple_of=multiple_of)
-    return type('ConstrainedFloatValue', (ConstrainedFloat,), namespace)
-
-
-class PositiveFloat(ConstrainedFloat):
-    gt = 0
-
-
-class NegativeFloat(ConstrainedFloat):
-    lt = 0
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ DECIMAL TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
 class ConstrainedDecimal(Decimal, metaclass=ConstrainedNumberMeta):
-    gt: Union[None, int, float, Decimal] = None
-    ge: Union[None, int, float, Decimal] = None
-    lt: Union[None, int, float, Decimal] = None
-    le: Union[None, int, float, Decimal] = None
-    max_digits: Optional[int] = None
-    decimal_places: Optional[int] = None
-    multiple_of: Optional[Union[int, float]] = None
+    gt: OptionalIntFloatDecimal = None
+    ge: OptionalIntFloatDecimal = None
+    lt: OptionalIntFloatDecimal = None
+    le: OptionalIntFloatDecimal = None
+    max_digits: OptionalInt = None
+    decimal_places: OptionalInt = None
+    multiple_of: OptionalIntFloatDecimal = None
 
     @classmethod
-    def __get_validators__(cls):
-        yield not_none_validator
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(
+            field_schema,
+            exclusiveMinimum=cls.gt,
+            exclusiveMaximum=cls.lt,
+            minimum=cls.ge,
+            maximum=cls.le,
+            multipleOf=cls.multiple_of,
+        )
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
         yield decimal_validator
         yield number_size_validator
         yield number_multiple_validator
@@ -395,7 +687,14 @@ class ConstrainedDecimal(Decimal, metaclass=ConstrainedNumberMeta):
 
 
 def condecimal(
-    *, gt=None, ge=None, lt=None, le=None, max_digits=None, decimal_places=None, multiple_of=None
+    *,
+    gt: Decimal = None,
+    ge: Decimal = None,
+    lt: Decimal = None,
+    le: Decimal = None,
+    max_digits: int = None,
+    decimal_places: int = None,
+    multiple_of: Decimal = None,
 ) -> Type[Decimal]:
     # use kwargs then define conf in a dict to aid with IDE type hinting
     namespace = dict(
@@ -404,72 +703,416 @@ def condecimal(
     return type('ConstrainedDecimalValue', (ConstrainedDecimal,), namespace)
 
 
-class UUID1(UUID):
-    _required_version = 1
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ UUID TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+if TYPE_CHECKING:
+    UUID1 = UUID
+    UUID3 = UUID
+    UUID4 = UUID
+    UUID5 = UUID
+else:
+
+    class UUID1(UUID):
+        _required_version = 1
+
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            field_schema.update(type='string', format=f'uuid{cls._required_version}')
+
+    class UUID3(UUID1):
+        _required_version = 3
+
+    class UUID4(UUID1):
+        _required_version = 4
+
+    class UUID5(UUID1):
+        _required_version = 5
 
 
-class UUID3(UUID):
-    _required_version = 3
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ PATH TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+if TYPE_CHECKING:
+    FilePath = Path
+    DirectoryPath = Path
+else:
+
+    class FilePath(Path):
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            field_schema.update(format='file-path')
+
+        @classmethod
+        def __get_validators__(cls) -> 'CallableGenerator':
+            yield path_validator
+            yield path_exists_validator
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, value: Path) -> Path:
+            if not value.is_file():
+                raise errors.PathNotAFileError(path=value)
+
+            return value
+
+    class DirectoryPath(Path):
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            field_schema.update(format='directory-path')
+
+        @classmethod
+        def __get_validators__(cls) -> 'CallableGenerator':
+            yield path_validator
+            yield path_exists_validator
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, value: Path) -> Path:
+            if not value.is_dir():
+                raise errors.PathNotADirectoryError(path=value)
+
+            return value
 
 
-class UUID4(UUID):
-    _required_version = 4
-
-
-class UUID5(UUID):
-    _required_version = 5
-
-
-class FilePath(Path):
-    @classmethod
-    def __get_validators__(cls):
-        yield path_validator
-        yield path_exists_validator
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, value: Path) -> Path:
-        if not value.is_file():
-            raise errors.PathNotAFileError(path=value)
-
-        return value
-
-
-class DirectoryPath(Path):
-    @classmethod
-    def __get_validators__(cls):
-        yield path_validator
-        yield path_exists_validator
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, value: Path) -> Path:
-        if not value.is_dir():
-            raise errors.PathNotADirectoryError(path=value)
-
-        return value
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ JSON TYPE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
 class JsonWrapper:
-    __slots__ = ('inner_type',)
+    pass
 
 
 class JsonMeta(type):
-    def __getitem__(self, t):
-        return type('JsonWrapperValue', (JsonWrapper,), {'inner_type': t})
+    def __getitem__(self, t: Type[Any]) -> Type[JsonWrapper]:
+        return _registered(type('JsonWrapperValue', (JsonWrapper,), {'inner_type': t}))
 
 
-class Json(metaclass=JsonMeta):
+if TYPE_CHECKING:
+    Json = str
+else:
+
+    class Json(metaclass=JsonMeta):
+        @classmethod
+        def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+            field_schema.update(type='string', format='json-string')
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ SECRET TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class SecretStr:
+    min_length: OptionalInt = None
+    max_length: OptionalInt = None
+
     @classmethod
-    def __get_validators__(cls):
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(
+            field_schema,
+            type='string',
+            writeOnly=True,
+            format='password',
+            minLength=cls.min_length,
+            maxLength=cls.max_length,
+        )
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield cls.validate
+        yield constr_length_validator
+
+    @classmethod
+    def validate(cls, value: Any) -> 'SecretStr':
+        if isinstance(value, cls):
+            return value
+        value = str_validator(value)
+        return cls(value)
+
+    def __init__(self, value: str):
+        self._secret_value = value
+
+    def __repr__(self) -> str:
+        return f"SecretStr('{self}')"
+
+    def __str__(self) -> str:
+        return '**********' if self._secret_value else ''
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SecretStr) and self.get_secret_value() == other.get_secret_value()
+
+    def __len__(self) -> int:
+        return len(self._secret_value)
+
+    def display(self) -> str:
+        warnings.warn('`secret_str.display()` is deprecated, use `str(secret_str)` instead', DeprecationWarning)
+        return str(self)
+
+    def get_secret_value(self) -> str:
+        return self._secret_value
+
+
+class SecretBytes:
+    min_length: OptionalInt = None
+    max_length: OptionalInt = None
+
+    @classmethod
+    def __modify_schema__(cls, field_schema: Dict[str, Any]) -> None:
+        update_not_none(
+            field_schema,
+            type='string',
+            writeOnly=True,
+            format='password',
+            minLength=cls.min_length,
+            maxLength=cls.max_length,
+        )
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
+        yield cls.validate
+        yield constr_length_validator
+
+    @classmethod
+    def validate(cls, value: Any) -> 'SecretBytes':
+        if isinstance(value, cls):
+            return value
+        value = bytes_validator(value)
+        return cls(value)
+
+    def __init__(self, value: bytes):
+        self._secret_value = value
+
+    def __repr__(self) -> str:
+        return f"SecretBytes(b'{self}')"
+
+    def __str__(self) -> str:
+        return '**********' if self._secret_value else ''
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, SecretBytes) and self.get_secret_value() == other.get_secret_value()
+
+    def __len__(self) -> int:
+        return len(self._secret_value)
+
+    def display(self) -> str:
+        warnings.warn('`secret_bytes.display()` is deprecated, use `str(secret_bytes)` instead', DeprecationWarning)
+        return str(self)
+
+    def get_secret_value(self) -> bytes:
+        return self._secret_value
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ PAYMENT CARD TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class PaymentCardBrand(str, Enum):
+    # If you add another card type, please also add it to the
+    # Hypothesis strategy in `pydantic._hypothesis_plugin`.
+    amex = 'American Express'
+    mastercard = 'Mastercard'
+    visa = 'Visa'
+    other = 'other'
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class PaymentCardNumber(str):
+    """
+    Based on: https://en.wikipedia.org/wiki/Payment_card_number
+    """
+
+    strip_whitespace: ClassVar[bool] = True
+    min_length: ClassVar[int] = 12
+    max_length: ClassVar[int] = 19
+    bin: str
+    last4: str
+    brand: PaymentCardBrand
+
+    def __init__(self, card_number: str):
+        self.bin = card_number[:6]
+        self.last4 = card_number[-4:]
+        self.brand = self._get_brand(card_number)
+
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
         yield str_validator
+        yield constr_strip_whitespace
+        yield constr_length_validator
+        yield cls.validate_digits
+        yield cls.validate_luhn_check_digit
+        yield cls
+        yield cls.validate_length_for_brand
+
+    @property
+    def masked(self) -> str:
+        num_masked = len(self) - 10  # len(bin) + len(last4) == 10
+        return f'{self.bin}{"*" * num_masked}{self.last4}'
+
+    @classmethod
+    def validate_digits(cls, card_number: str) -> str:
+        if not card_number.isdigit():
+            raise errors.NotDigitError
+        return card_number
+
+    @classmethod
+    def validate_luhn_check_digit(cls, card_number: str) -> str:
+        """
+        Based on: https://en.wikipedia.org/wiki/Luhn_algorithm
+        """
+        sum_ = int(card_number[-1])
+        length = len(card_number)
+        parity = length % 2
+        for i in range(length - 1):
+            digit = int(card_number[i])
+            if i % 2 == parity:
+                digit *= 2
+            if digit > 9:
+                digit -= 9
+            sum_ += digit
+        valid = sum_ % 10 == 0
+        if not valid:
+            raise errors.LuhnValidationError
+        return card_number
+
+    @classmethod
+    def validate_length_for_brand(cls, card_number: 'PaymentCardNumber') -> 'PaymentCardNumber':
+        """
+        Validate length based on BIN for major brands:
+        https://en.wikipedia.org/wiki/Payment_card_number#Issuer_identification_number_(IIN)
+        """
+        required_length: Union[None, int, str] = None
+        if card_number.brand in PaymentCardBrand.mastercard:
+            required_length = 16
+            valid = len(card_number) == required_length
+        elif card_number.brand == PaymentCardBrand.visa:
+            required_length = '13, 16 or 19'
+            valid = len(card_number) in {13, 16, 19}
+        elif card_number.brand == PaymentCardBrand.amex:
+            required_length = 15
+            valid = len(card_number) == required_length
+        else:
+            valid = True
+        if not valid:
+            raise errors.InvalidLengthForBrand(brand=card_number.brand, required_length=required_length)
+        return card_number
+
+    @staticmethod
+    def _get_brand(card_number: str) -> PaymentCardBrand:
+        if card_number[0] == '4':
+            brand = PaymentCardBrand.visa
+        elif 51 <= int(card_number[:2]) <= 55:
+            brand = PaymentCardBrand.mastercard
+        elif card_number[:2] in {'34', '37'}:
+            brand = PaymentCardBrand.amex
+        else:
+            brand = PaymentCardBrand.other
+        return brand
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ BYTE SIZE TYPE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+BYTE_SIZES = {
+    'b': 1,
+    'kb': 10**3,
+    'mb': 10**6,
+    'gb': 10**9,
+    'tb': 10**12,
+    'pb': 10**15,
+    'eb': 10**18,
+    'kib': 2**10,
+    'mib': 2**20,
+    'gib': 2**30,
+    'tib': 2**40,
+    'pib': 2**50,
+    'eib': 2**60,
+}
+BYTE_SIZES.update({k.lower()[0]: v for k, v in BYTE_SIZES.items() if 'i' not in k})
+byte_string_re = re.compile(r'^\s*(\d*\.?\d+)\s*(\w+)?', re.IGNORECASE)
+
+
+class ByteSize(int):
+    @classmethod
+    def __get_validators__(cls) -> 'CallableGenerator':
         yield cls.validate
 
     @classmethod
-    def validate(cls, v: str):
+    def validate(cls, v: StrIntFloat) -> 'ByteSize':
+
         try:
-            return json.loads(v)
+            return cls(int(v))
         except ValueError:
-            raise errors.JsonError()
-        except TypeError:
-            raise errors.JsonTypeError()
+            pass
+
+        str_match = byte_string_re.match(str(v))
+        if str_match is None:
+            raise errors.InvalidByteSize()
+
+        scalar, unit = str_match.groups()
+        if unit is None:
+            unit = 'b'
+
+        try:
+            unit_mult = BYTE_SIZES[unit.lower()]
+        except KeyError:
+            raise errors.InvalidByteSizeUnit(unit=unit)
+
+        return cls(int(float(scalar) * unit_mult))
+
+    def human_readable(self, decimal: bool = False) -> str:
+
+        if decimal:
+            divisor = 1000
+            units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+            final_unit = 'EB'
+        else:
+            divisor = 1024
+            units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+            final_unit = 'EiB'
+
+        num = float(self)
+        for unit in units:
+            if abs(num) < divisor:
+                return f'{num:0.1f}{unit}'
+            num /= divisor
+
+        return f'{num:0.1f}{final_unit}'
+
+    def to(self, unit: str) -> float:
+
+        try:
+            unit_div = BYTE_SIZES[unit.lower()]
+        except KeyError:
+            raise errors.InvalidByteSizeUnit(unit=unit)
+
+        return self / unit_div
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ DATE TYPES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+if TYPE_CHECKING:
+    PastDate = date
+    FutureDate = date
+else:
+
+    class PastDate(date):
+        @classmethod
+        def __get_validators__(cls) -> 'CallableGenerator':
+            yield parse_date
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, value: date) -> date:
+            if value >= date.today():
+                raise errors.DateNotInThePastError()
+
+            return value
+
+    class FutureDate(date):
+        @classmethod
+        def __get_validators__(cls) -> 'CallableGenerator':
+            yield parse_date
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, value: date) -> date:
+            if value <= date.today():
+                raise errors.DateNotInTheFutureError()
+
+            return value

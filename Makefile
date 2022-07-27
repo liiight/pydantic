@@ -1,76 +1,131 @@
 .DEFAULT_GOAL := all
+isort = isort pydantic tests
+black = black -S -l 120 --target-version py38 pydantic tests
+
+.PHONY: install-linting
+install-linting:
+	pip install -r tests/requirements-linting.txt
+	pre-commit install
+
+.PHONY: install-pydantic
+install-pydantic:
+	python -m pip install -U wheel pip
+	pip install -r requirements.txt
+	SKIP_CYTHON=1 pip install -e .
+
+.PHONY: install-testing
+install-testing: install-pydantic
+	pip install -r tests/requirements-testing.txt
+
+.PHONY: install-docs
+install-docs: install-pydantic
+	pip install -U -r docs/requirements.txt
 
 .PHONY: install
-install:
-	pip install -U setuptools pip
-	pip install -U -r requirements.txt
-	pip install -e .
+install: install-testing install-linting install-docs
+	@echo 'installed development requirements'
+
+.PHONY: build-trace
+build-trace:
+	python setup.py build_ext --force --inplace --define CYTHON_TRACE
+
+.PHONY: build
+build:
+	python setup.py build_ext --inplace
 
 .PHONY: format
 format:
-	isort -rc -w 120 pydantic tests
-	black -S -l 120 --py36 pydantic tests
+	pyupgrade --py37-plus  --exit-zero-even-if-changed `find pydantic tests -name "*.py" -type f`
+	$(isort)
+	$(black)
 
 .PHONY: lint
 lint:
-	python setup.py check -rms
 	flake8 pydantic/ tests/
-	pytest pydantic -p no:sugar -q
-	black -S -l 120 --py36 --check pydantic tests
+	$(isort) --check-only --df
+	$(black) --check --diff
+
+.PHONY: check-dist
+check-dist:
+	python setup.py check -ms
+	SKIP_CYTHON=1 python setup.py sdist
+	twine check dist/*
+
+.PHONY: mypy
+mypy:
+	mypy pydantic
+
+.PHONY: pyupgrade
+pyupgrade:
+	pyupgrade --py37-plus `find pydantic tests -name "*.py" -type f`
+
+.PHONY: pyright
+pyright:
+	cd tests/pyright && pyright
 
 .PHONY: test
 test:
 	pytest --cov=pydantic
 
-.PHONY: mypy
-mypy:
-	@echo "testing simple example with mypy (and python to check it's sane)..."
-	mypy --ignore-missing-imports --follow-imports=skip --strict-optional tests/mypy_test_success.py
-	python tests/mypy_test_success.py
-	@echo "checking code with bad type annotations fails..."
-	@mypy --ignore-missing-imports --follow-imports=skip tests/mypy_test_fails.py 1>/dev/null; \
-	  test $$? -eq 1 || \
-	  (echo "mypy passed when it shouldn't"; exit 1)
-	python tests/mypy_test_fails.py
-
 .PHONY: testcov
-testcov:
-	pytest --cov=pydantic
+testcov: test
 	@echo "building coverage html"
 	@coverage html
 
+.PHONY: testcov-compile
+testcov-compile: build-trace test
+	@echo "building coverage html"
+	@coverage html
+
+.PHONY: test-examples
+test-examples:
+	@echo "running examples"
+	@find docs/examples -type f -name '*.py' | xargs -I'{}' sh -c 'python {} >/dev/null 2>&1 || (echo "{} failed")'
+
+.PHONY: test-fastapi
+test-fastapi:
+	git clone https://github.com/tiangolo/fastapi.git --single-branch
+	./tests/test_fastapi.sh
+
 .PHONY: all
-all: testcov mypy lint
-
-.PHONY: benchmark-all
-benchmark-all:
-	python benchmarks/run.py
-
-.PHONY: benchmark-pydantic
-benchmark-pydantic:
-	python benchmarks/run.py pydantic-only
+all: lint mypy testcov
 
 .PHONY: clean
 clean:
 	rm -rf `find . -name __pycache__`
-	rm -f `find . -type f -name '*.py[co]' `
-	rm -f `find . -type f -name '*~' `
-	rm -f `find . -type f -name '.*~' `
+	rm -f `find . -type f -name '*.py[co]'`
+	rm -f `find . -type f -name '*~'`
+	rm -f `find . -type f -name '.*~'`
 	rm -rf .cache
+	rm -rf .pytest_cache
+	rm -rf .mypy_cache
 	rm -rf htmlcov
 	rm -rf *.egg-info
 	rm -f .coverage
 	rm -f .coverage.*
 	rm -rf build
+	rm -rf dist
+	rm -f pydantic/*.c pydantic/*.so
 	python setup.py clean
-	make -C docs clean
+	rm -rf site
+	rm -rf docs/_build
+	rm -rf docs/.changelog.md docs/.version.md docs/.tmp_schema_mappings.html
+	rm -rf fastapi/test.db
+	rm -rf coverage.xml
 
 .PHONY: docs
 docs:
-	make -C docs html
+	flake8 --max-line-length=80 docs/examples/
+	python docs/build/main.py
+	mkdocs build
 
-.PHONY: publish
-publish: docs
-	cd docs/_build/ && cp -r html site && zip -r site.zip site
+.PHONY: docs-serve
+docs-serve:
+	python docs/build/main.py
+	mkdocs serve
+
+.PHONY: publish-docs
+publish-docs:
+	zip -r site.zip site
 	@curl -H "Content-Type: application/zip" -H "Authorization: Bearer ${NETLIFY}" \
-	      --data-binary "@docs/_build/site.zip" https://api.netlify.com/api/v1/sites/pydantic-docs.netlify.com/deploys
+	      --data-binary "@site.zip" https://api.netlify.com/api/v1/sites/pydantic-docs.netlify.com/deploys

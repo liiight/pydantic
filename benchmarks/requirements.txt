@@ -1,7 +1,0 @@
-devtools             # pyup: ignore
-python-dateutil      # pyup: ignore
-trafaret             # pyup: ignore
-django               # pyup: ignore
-djangorestframework  # pyup: ignore
-#marshmallow          # pyup: ignore
-toastedmarshmallow   # pyup: ignore

@@ -10,3 +10,4 @@ mkdocs-material==8.3.8
 sqlalchemy
 orjson
 ujson
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability

@@ -10,3 +10,4 @@ mkdocs-material==8.3.8
 sqlalchemy
 orjson
 ujson
+pymdown-extensions>=10.16.1 # not directly required, pinned by Snyk to avoid a vulnerability
